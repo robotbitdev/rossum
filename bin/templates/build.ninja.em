@@ -105,12 +105,12 @@ rule maketp_ls
 rule tpp_tp
   command = "@(tools['tpp']['path'])" $
                $in $
-               -o $out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
+               -o $main_out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
                @[if makeenv]@ -k "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
                @[if keepgpp]@ -p @[end if]@ $
                $lib_includes $
-               && "@(tools['tpp']['compile'])" $out /config "@(ws.robot_ini.path)" $
-               && del $out
+               && "@(tools['tpp']['compile'])" $main_out /config "@(ws.robot_ini.path)" $
+               && del $main_out
 @[else]@
 # .tpp -> .ls
 #
@@ -118,12 +118,16 @@ rule tpp_tp
 rule tpp_ls
   command = "@(tools['tpp']['path'])" $
                $in $
-               -o $out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
+               -o $main_out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
                @[if makeenv]@ -k "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
                @[if keepgpp]@ -p @[end if]@ $
-               $lib_includes $ && python "@(rossum_script)" --update-manifest "$build_dir"
+               $lib_includes $
 @[end if]@
 @[end if]@
+
+rule manifest_update
+  command = python "@(rossum_script)" --update-manifest "$build_dir"
+  restat = 1
 
 
 
@@ -181,8 +185,8 @@ rule ftx_tx
 @(pkg.manifest.name.replace(" ", "_"))_include_flags = @(str.join(' ', ['/I"{0}"'.format(d) for d in pkg.include_dirs]))
 @(pkg.manifest.name.replace(" ", "_"))_macros = @(str.join(' ', ['/D{0}'.format(d) for d in pkg.macros]))
 
-@[for (src, obj, _, _) in pkg.objects]@
-build $build_dir\@(obj): @
+@[for (src, obj, _, _, main_out) in pkg.objects]@
+build @(ninja_build_outputs(obj)): @
 @[if '.kl' in src.lower()]@ ktrans_pc @[end if]@ @
 @[if '.ls' in src.lower() and compiletp]@ maketp_tp @[end if]@ @
 @[if '.ls' in src.lower() and not compiletp]@ maketp_ls @[end if]@ @
@@ -196,6 +200,7 @@ build $build_dir\@(obj): @
 $@(pkg.manifest.name.replace(" ", "_"))_dir\@(src)
   macros = $@(pkg.manifest.name.replace(" ", "_"))_macros
   lib_includes = $@(pkg.manifest.name.replace(" ", "_"))_include_flags
+  main_out = @(ninja_main_output(main_out))
   description = @(pkg.manifest.name.replace(" ", "_")) :: @(src)
 
 @[end for]@
@@ -205,3 +210,6 @@ $@(pkg.manifest.name.replace(" ", "_"))_dir\@(src)
 @# pkg in ws.pkgs
 @[end if]@
 @[end for]@
+
+build $build_dir\.manifest.stamp: manifest_update @(ninja_all_outputs(ws.pkgs))
+default $build_dir\.manifest.stamp

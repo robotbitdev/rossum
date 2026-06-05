@@ -310,7 +310,11 @@ def main():
     args = parser.parse_args()
 
     if args.update_manifest_dir:
-        update_tp_outputs(os.path.abspath(args.update_manifest_dir))
+        manifest_build_dir = os.path.abspath(args.update_manifest_dir)
+        update_tp_outputs(manifest_build_dir)
+        stamp_path = os.path.join(manifest_build_dir, '.manifest.stamp')
+        with open(stamp_path, 'a'):
+            os.utime(stamp_path, None)
         sys.exit(0)
 
 
@@ -658,6 +662,9 @@ def main():
         'hastpp'         : args.hastpp,
         'makeenv'        : make_tpp_env_file,
         'rossum_script'  : os.path.join(template_dir, os.path.basename(__file__)),
+        'ninja_build_outputs' : ninja_build_outputs,
+        'ninja_main_output'   : ninja_main_output,
+        'ninja_all_outputs'   : ninja_all_outputs,
     }
     # write out ninja template
     ninja_fl = open(build_file_path, 'w')
@@ -672,7 +679,7 @@ def main():
     ninja_interp.shutdown()
 
     # write build files in manifest
-    man_list = [(obj[2], obj[3]) for pkg in ws.pkgs for obj in pkg.objects]
+    man_list = manifest_objects(ws.pkgs)
     write_manifest(FILE_MANIFEST, man_list, robini_info.ftp)
 
     # done
@@ -1243,11 +1250,62 @@ def build_output_name(src, suffix, preserve_build_paths):
     return '{}.{}'.format(os.path.join(*parts), suffix)
 
 
+def as_list(value):
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def build_output_names(src, suffix, preserve_build_paths, child_bases=None):
+    parent_output = build_output_name(src, suffix, preserve_build_paths)
+    if not child_bases:
+        return parent_output, parent_output
+
+    parent_dir = os.path.dirname(parent_output)
+    child_outputs = []
+    for child_base in child_bases:
+        child_name = '{}.{}'.format(child_base, suffix)
+        child_outputs.append(os.path.join(parent_dir, child_name) if parent_dir else child_name)
+
+    return child_outputs, parent_output
+
+
+def ninja_build_outputs(outputs):
+    return ' '.join(['$build_dir\\{}'.format(output) for output in as_list(outputs)])
+
+
+def ninja_main_output(output):
+    return '$build_dir\\{}'.format(output)
+
+
+def ninja_all_outputs(pkgs):
+    outputs = []
+    for pkg in pkgs:
+        for obj in pkg.objects:
+            outputs.extend(['$build_dir\\{}'.format(output) for output in as_list(obj[1])])
+    return ' '.join(outputs)
+
+
+def manifest_objects(pkgs):
+    objects = []
+    for pkg in pkgs:
+        for obj in pkg.objects:
+            for output in as_list(obj[2]):
+                objects.append((output, obj[3]))
+    return objects
+
+
 def ensure_output_dirs(pkgs, build_dir):
     """Create build output directories used by generated Ninja rules."""
     for pkg in pkgs:
-        for _, obj, build, _ in pkg.objects:
-            for output in (obj, build):
+        for obj in pkg.objects:
+            outputs = []
+            outputs.extend(as_list(obj[1]))
+            outputs.extend(as_list(obj[2]))
+            if len(obj) > 4:
+                outputs.append(obj[4])
+
+            for output in outputs:
                 output_dir = os.path.dirname(os.path.join(build_dir, output))
                 if output_dir and not os.path.exists(output_dir):
                     os.makedirs(output_dir)
@@ -1265,6 +1323,7 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
 
     for pkg in pkgs:
         logger.debug("  {}".format(pkg.manifest.name))
+        cell_no = cell_no_from_macros(pkg.macros)
 
         # include forms in source
         if args.build_forms:
@@ -1281,8 +1340,9 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
             src = src.replace('/', '\\')
             for (k, v) in mappings.items():
                 if '.' + v['from_suffix'] in src:
-                    obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
-                    build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
+                    child_bases = tpp_child_outputs(pkg.location, src, cell_no) if k == 'tpp' and not args.compiletp else []
+                    obj, main_out = build_output_names(src, v['interp_suffix'], args.preserve_build_paths, child_bases)
+                    build, _ = build_output_names(src, v['comp_suffix'], args.preserve_build_paths, child_bases)
                     if v['type'] == 'karel':
                       typ = 'src'
                     else:
@@ -1291,7 +1351,7 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
                     if k == 'tpp':
                       args.hastpp = True
             logger.debug("    adding: {} -> {}".format(src, obj))
-            pkg.objects.append((src, obj, build, typ))
+            pkg.objects.append((src, obj, build, typ, main_out))
 
         # add interfaces to mappings
         if (args.build_interface):
@@ -1300,11 +1360,11 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
               src = src.replace('/', '\\')
               for (k, v) in mappings.items():
                   if '.' + v['from_suffix'] in src:
-                      obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
-                      build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
+                      obj, main_out = build_output_names(src, v['interp_suffix'], args.preserve_build_paths)
+                      build, _ = build_output_names(src, v['comp_suffix'], args.preserve_build_paths)
                       typ = 'interface'
               logger.debug("    adding: {} -> {}".format(src, obj))
-              pkg.objects.append((src, obj, build, typ))
+              pkg.objects.append((src, obj, build, typ, main_out))
 
         # add tests to mappings
         if (args.inc_tests) and any(pkg.manifest.name in x.name for x in dep_graph.root):
@@ -1312,8 +1372,9 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
               src = src.replace('/', '\\')
               for (k, v) in mappings.items():
                   if '.' + v['from_suffix'] in src:
-                      obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
-                      build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
+                      child_bases = tpp_child_outputs(pkg.location, src, cell_no) if k == 'tpp' and not args.compiletp else []
+                      obj, main_out = build_output_names(src, v['interp_suffix'], args.preserve_build_paths, child_bases)
+                      build, _ = build_output_names(src, v['comp_suffix'], args.preserve_build_paths, child_bases)
                       if v['type'] == 'karel':
                         typ = 'test'
                       else:
@@ -1322,7 +1383,53 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
                       if k == 'tpp':
                         args.hastpp = True
               logger.debug("    adding: {} -> {}".format(src, obj))
-              pkg.objects.append((src, obj, build, typ))
+              pkg.objects.append((src, obj, build, typ, main_out))
+
+
+def cell_no_from_macros(macros):
+    for macro in macros:
+        match = re.match(r'CELL_NO=([0-9]+)', macro)
+        if match:
+            return match.group(1)
+    return None
+
+
+def tpp_child_outputs(pkg_location, src, cell_no):
+    source_path = os.path.normpath(os.path.join(pkg_location, src))
+    if not os.path.exists(source_path):
+        return []
+    if not tpp_is_function_only(source_path):
+        return []
+    return parse_tpp_child_bases(source_path, cell_no)
+
+
+def tpp_is_function_only(source_path):
+    block_depth = 0
+    saw_function = False
+
+    with open(source_path, 'r') as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith('#') or line.startswith('.'):
+                continue
+
+            if re.match(r'namespace\b', line):
+                block_depth += 1
+                continue
+
+            if re.match(r'(inline\s+)?def\s+', line):
+                block_depth += 1
+                saw_function = True
+                continue
+
+            if line == 'end':
+                block_depth = max(0, block_depth - 1)
+                continue
+
+            if block_depth == 0:
+                return False
+
+    return saw_function
 
 
 def find_fr_install_dir(search_locs, is64bit=False):
@@ -1511,15 +1618,7 @@ def write_manifest(manifest, files, ipAddress):
       tp+, ls, xml/csv files.
     """
 
-    file_list = dict()
-
-    #load in manifest if it exists
-    if os.path.exists(manifest):
-      with open(manifest) as man:
-        file_list = yaml.load(man, Loader=yaml.FullLoader)
-
-    #save ip address
-    file_list['ip'] = ipAddress
+    file_list = {'ip': ipAddress}
 
     #save file. null list in value is for ktransw objects
     #and templates
@@ -1602,6 +1701,9 @@ def generated_tp_outputs(build_dir, parent_file):
         return []
 
     expected = [base.lower() for base in expected_tp_child_bases(build_dir).get(os.path.normcase(parent_path), [])]
+    if parent_base.lower() in expected:
+        return []
+
     prefix = (parent_base + '_').lower()
     matches = []
 
@@ -1650,9 +1752,8 @@ def expected_tp_child_bases(build_dir):
         if not match:
             continue
 
-        parent_output = expand_ninja_vars(match.group(1), variables)
+        parent_outputs = [expand_ninja_vars(output, variables) for output in match.group(1).split()]
         source_path = expand_ninja_vars(match.group(2).split()[0], variables)
-        parent_rel = os.path.relpath(os.path.normpath(parent_output), build_dir)
         source_path = os.path.normpath(source_path)
 
         if not os.path.exists(source_path):
@@ -1660,7 +1761,9 @@ def expected_tp_child_bases(build_dir):
 
         bases = parse_tpp_child_bases(source_path, cell_no)
         if bases:
-            child_bases[os.path.normcase(parent_rel)] = bases
+            for parent_output in parent_outputs:
+                parent_rel = os.path.relpath(os.path.normpath(parent_output), build_dir)
+                child_bases[os.path.normcase(parent_rel)] = bases
 
     return child_bases
 
