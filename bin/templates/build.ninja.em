@@ -121,7 +121,7 @@ rule tpp_ls
                -o $out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
                @[if makeenv]@ -k "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
                @[if keepgpp]@ -p @[end if]@ $
-               $lib_includes $ && python "$build_dir\update_manifest.py"
+               $lib_includes $ && python "@(rossum_script)" --update-manifest "$build_dir"
 @[end if]@
 @[end if]@
 

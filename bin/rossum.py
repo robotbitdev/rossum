@@ -34,6 +34,7 @@ import json
 import yaml
 import configparser
 import fnmatch
+import time
 from send2trash import send2trash
 
 import collections
@@ -295,6 +296,8 @@ def main():
         help='include ls files for building')
     parser.add_argument('--clean', action='store_true', dest='rossum_clean',
         help='clean all files out of build directory')
+    parser.add_argument('--update-manifest', type=str, dest='update_manifest_dir',
+        metavar='BUILD', help=argparse.SUPPRESS)
     parser.add_argument('src_dir', type=str, nargs='?', metavar='SRC',
         help="Main directory with packages to build")
     parser.add_argument('build_dir', type=str, nargs='?', metavar='BUILD',
@@ -305,6 +308,10 @@ def main():
         if sys.argv[i].startswith('/D'):
             sys.argv[i] = sys.argv[i].replace('/D', '-D', 1)
     args = parser.parse_args()
+
+    if args.update_manifest_dir:
+        update_tp_outputs(os.path.abspath(args.update_manifest_dir))
+        sys.exit(0)
 
 
 
@@ -650,6 +657,7 @@ def main():
         'compiletp'      : args.compiletp,
         'hastpp'         : args.hastpp,
         'makeenv'        : make_tpp_env_file,
+        'rossum_script'  : os.path.join(template_dir, os.path.basename(__file__)),
     }
     # write out ninja template
     ninja_fl = open(build_file_path, 'w')
@@ -666,9 +674,6 @@ def main():
     # write build files in manifest
     man_list = [(obj[2], obj[3]) for pkg in ws.pkgs for obj in pkg.objects]
     write_manifest(FILE_MANIFEST, man_list, robini_info.ftp)
-
-    # write post-build updater script for tp-plus multi-file outputs
-    write_manifest_updater(build_dir)
 
     # done
     logger.info("Configuration successful, you may now run 'ninja' in the "
@@ -1530,26 +1535,14 @@ def write_manifest(manifest, files, ipAddress):
       yaml.dump(file_list, man)
 
 
-def write_manifest_updater(build_dir):
-    """Write a post-build script that updates .man_log with actual
-    tp-plus generated files (which may differ from declared outputs).
-    """
-    updater_path = os.path.join(build_dir, 'update_manifest.py')
-    updater_content = '''#!/usr/bin/env python
-import os
-import yaml
-import glob
-import time
-
-MANIFEST = '.man_log'
-
-def update_tp_outputs():
-    if not os.path.exists(MANIFEST):
+def update_tp_outputs(build_dir):
+    """Update .man_log with tp-plus files generated from non-inline functions."""
+    manifest_path = os.path.join(build_dir, FILE_MANIFEST)
+    if not os.path.exists(manifest_path):
         return
-    
-    lock_path = MANIFEST + '.lock'
-    
-    # acquire lock
+
+    lock_path = manifest_path + '.lock'
+
     while True:
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -1557,14 +1550,13 @@ def update_tp_outputs():
             break
         except FileExistsError:
             time.sleep(0.05)
-    
+
     try:
-        # retry loading in case of concurrent write
         manifest = {}
         attempts = 0
         while attempts < 5:
             try:
-                with open(MANIFEST, 'r') as f:
+                with open(manifest_path, 'r') as f:
                     manifest = yaml.safe_load(f) or {}
                 if isinstance(manifest, dict):
                     break
@@ -1572,28 +1564,25 @@ def update_tp_outputs():
                 pass
             attempts += 1
             time.sleep(0.05)
-        
+
         if not isinstance(manifest, dict):
             return
-        
-        # scan tp/test_tp sections for multi-file outputs
+
         for section in ('tp', 'test_tp'):
             if section not in manifest or not isinstance(manifest[section], dict):
                 continue
-            
+
             for parent_file in list(manifest[section].keys()):
-                base_name = os.path.splitext(parent_file)[0]
-                # find all .ls/.tp files with base_name prefix (case-insensitive)
-                pattern = base_name.capitalize() + '_*.ls'
-                matches = glob.glob(pattern, recursive=False)
-                pattern_tp = base_name.capitalize() + '_*.tp'
-                matches.extend(glob.glob(pattern_tp, recursive=False))
-                
+                matches = generated_tp_outputs(build_dir, parent_file)
                 if matches:
-                    # update manifest with actual generated files
-                    manifest[section][parent_file] = sorted(set(matches))
-        
-        with open(MANIFEST, 'w') as f:
+                    if tp_output_exists(build_dir, parent_file):
+                        manifest[section][parent_file] = sorted(set(matches))
+                    else:
+                        del manifest[section][parent_file]
+                        for generated_file in sorted(set(matches)):
+                            manifest[section].setdefault(generated_file, [])
+
+        with open(manifest_path, 'w') as f:
             yaml.safe_dump(manifest, f)
     finally:
         try:
@@ -1601,11 +1590,134 @@ def update_tp_outputs():
         except OSError:
             pass
 
-if __name__ == '__main__':
-    update_tp_outputs()
-'''
-    with open(updater_path, 'w') as f:
-        f.write(updater_content)
+
+def generated_tp_outputs(build_dir, parent_file):
+    """Find child .ls/.tp files generated by a parent tp-plus output."""
+    parent_path = parent_file.replace('/', os.sep).replace('\\', os.sep)
+    parent_dir = os.path.dirname(parent_path)
+    parent_base = os.path.splitext(os.path.basename(parent_path))[0]
+    search_dir = os.path.join(build_dir, parent_dir)
+
+    if not os.path.isdir(search_dir):
+        return []
+
+    expected = [base.lower() for base in expected_tp_child_bases(build_dir).get(os.path.normcase(parent_path), [])]
+    prefix = (parent_base + '_').lower()
+    matches = []
+
+    for filename in os.listdir(search_dir):
+        name, ext = os.path.splitext(filename)
+        if ext.lower() not in ('.ls', '.tp'):
+            continue
+
+        if name.lower() in expected or name.lower().startswith(prefix):
+            generated_file = os.path.join(parent_dir, filename) if parent_dir else filename
+            matches.append(generated_file)
+
+    return matches
+
+
+def tp_output_exists(build_dir, output_file):
+    output_path = output_file.replace('/', os.sep).replace('\\', os.sep)
+    return os.path.exists(os.path.join(build_dir, output_path))
+
+
+def expected_tp_child_bases(build_dir):
+    """Map parent outputs to expected child output basenames from source .tpp."""
+    ninja_path = os.path.join(build_dir, BUILD_FILE_NAME)
+    if not os.path.exists(ninja_path):
+        return {}
+
+    with open(ninja_path, 'r') as f:
+        lines = f.readlines()
+
+    variables = {}
+    for line in lines:
+        if line.startswith('build '):
+            continue
+        match = re.match(r'^([A-Za-z0-9_.-]+)\s*=\s*(.*)$', line.rstrip())
+        if match:
+            variables[match.group(1)] = match.group(2)
+
+    child_bases = {}
+    cell_no = find_cell_no(variables)
+
+    for line in lines:
+        if not line.startswith('build ') or ' tpp_' not in line:
+            continue
+
+        match = re.match(r'^build\s+(.+?):\s+\S+\s+(.+)$', line.rstrip())
+        if not match:
+            continue
+
+        parent_output = expand_ninja_vars(match.group(1), variables)
+        source_path = expand_ninja_vars(match.group(2).split()[0], variables)
+        parent_rel = os.path.relpath(os.path.normpath(parent_output), build_dir)
+        source_path = os.path.normpath(source_path)
+
+        if not os.path.exists(source_path):
+            continue
+
+        bases = parse_tpp_child_bases(source_path, cell_no)
+        if bases:
+            child_bases[os.path.normcase(parent_rel)] = bases
+
+    return child_bases
+
+
+def expand_ninja_vars(value, variables):
+    """Expand the simple $var and ${var} forms emitted by Rossum."""
+    def replace_braced(match):
+        return variables.get(match.group(1), match.group(0))
+
+    value = re.sub(r'\$\{([^}]+)\}', replace_braced, value)
+
+    def replace_plain(match):
+        return variables.get(match.group(1), match.group(0))
+
+    return re.sub(r'\$([A-Za-z0-9_.-]+)', replace_plain, value)
+
+
+def find_cell_no(variables):
+    for name, value in variables.items():
+        if not name.endswith('_macros'):
+            continue
+        match = re.search(r'/DCELL_NO=([0-9]+)', value)
+        if match:
+            return match.group(1)
+    return None
+
+
+def parse_tpp_child_bases(source_path, cell_no):
+    namespace = ''
+    child_bases = []
+
+    with open(source_path, 'r') as f:
+        for line in f:
+            namespace_match = re.match(r'\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\b', line)
+            if namespace_match:
+                namespace = resolve_tpp_name(namespace_match.group(1), cell_no)
+                continue
+
+            function_match = re.match(r'\s*(inline\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', line)
+            if not function_match or function_match.group(1):
+                continue
+
+            function_name = resolve_tpp_name(function_match.group(2), cell_no)
+            if namespace:
+                child_bases.append('{}_{}'.format(namespace, function_name))
+            else:
+                child_bases.append(function_name)
+
+    return child_bases
+
+
+def resolve_tpp_name(name, cell_no):
+    if cell_no:
+        if name.startswith('CELL_ID'):
+            return 'cell{}{}'.format(cell_no, name[len('CELL_ID'):].lower())
+        name = name.replace('CELL_ID', 'cell{}'.format(cell_no))
+    return name
 
 
 #Class to represent a graph 
