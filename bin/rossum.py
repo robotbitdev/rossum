@@ -288,6 +288,9 @@ def main():
         'This is needed to use karel routines within a tp program')
     parser.add_argument('-f', '--build-forms', action='store_true', dest='build_forms',
         help='include forms for building')
+    parser.add_argument('-o', '--preserve-build-paths', action='store_true',
+        dest='preserve_build_paths',
+        help='preserve package-relative paths in the build output directory')
     parser.add_argument('-l', '--build-tp', action='store_true', dest='build_ls',
         help='include ls files for building')
     parser.add_argument('--clean', action='store_true', dest='rossum_clean',
@@ -326,6 +329,8 @@ def main():
         file_path = os.path.join(build_dir, filename)
         try:
             if os.path.isfile(file_path) or os.path.islink(file_path):
+                send2trash(file_path)
+            elif os.path.isdir(file_path):
                 send2trash(file_path)
         except Exception as e:
             print('Failed to delete %s. Reason: %s' % (file_path, e))
@@ -573,6 +578,8 @@ def main():
     if args.dry_run:
         logger.info("Requested dry-run, not saving build file")
         sys.exit(0)
+
+    ensure_output_dirs(build_pkgs, build_dir)
 
 
     ############################################################################
@@ -1202,6 +1209,45 @@ def create_interfaces(interfaces):
             fl.write(program)
 
 
+def build_output_name(src, suffix, preserve_build_paths):
+    """Return a build-dir-relative output path for a package source file."""
+    src = os.path.normpath(src)
+    base = os.path.splitext(os.path.basename(src))[0]
+
+    if not preserve_build_paths:
+        return '{}.{}'.format(base, suffix)
+
+    stem = os.path.splitext(src)[0]
+    drive, tail = os.path.splitdrive(stem)
+    parts = []
+
+    if drive:
+        parts.extend(['_absolute', drive.replace(':', '')])
+
+    for part in tail.replace('/', '\\').split('\\'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            parts.append('_external')
+        else:
+            parts.append(part)
+
+    if not parts:
+        parts.append(base)
+
+    return '{}.{}'.format(os.path.join(*parts), suffix)
+
+
+def ensure_output_dirs(pkgs, build_dir):
+    """Create build output directories used by generated Ninja rules."""
+    for pkg in pkgs:
+        for _, obj, build, _ in pkg.objects:
+            for output in (obj, build):
+                output_dir = os.path.dirname(os.path.join(build_dir, output))
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+
+
 def gen_obj_mappings(pkgs, mappings, args, dep_graph):
     """ Updates the 'objects' member variable of each pkg with tuples of the
     form (path\to\a.kl, a.pc).
@@ -1230,8 +1276,8 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
             src = src.replace('/', '\\')
             for (k, v) in mappings.items():
                 if '.' + v['from_suffix'] in src:
-                    obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['interp_suffix'])
-                    build = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['comp_suffix'])
+                    obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
+                    build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
                     if v['type'] == 'karel':
                       typ = 'src'
                     else:
@@ -1249,8 +1295,8 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
               src = src.replace('/', '\\')
               for (k, v) in mappings.items():
                   if '.' + v['from_suffix'] in src:
-                      obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['interp_suffix'])
-                      build = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['comp_suffix'])
+                      obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
+                      build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
                       typ = 'interface'
               logger.debug("    adding: {} -> {}".format(src, obj))
               pkg.objects.append((src, obj, build, typ))
@@ -1261,8 +1307,8 @@ def gen_obj_mappings(pkgs, mappings, args, dep_graph):
               src = src.replace('/', '\\')
               for (k, v) in mappings.items():
                   if '.' + v['from_suffix'] in src:
-                      obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['interp_suffix'])
-                      build = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['comp_suffix'])
+                      obj = build_output_name(src, v['interp_suffix'], args.preserve_build_paths)
+                      build = build_output_name(src, v['comp_suffix'], args.preserve_build_paths)
                       if v['type'] == 'karel':
                         typ = 'test'
                       else:

@@ -94,9 +94,7 @@ rule maketp_tp
 #
 # Run ls files through
 rule maketp_ls
-  command = "@(tools['maketp']['path'])" /y /q $
-               $in $
-               "$build_dir" $
+  command = powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path (Split-Path -Parent '$out') | Out-Null; Copy-Item -LiteralPath '$in' -Destination '$out' -Force"
 @[end if]@
 
 @[if hastpp]@
