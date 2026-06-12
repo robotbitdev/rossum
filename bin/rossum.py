@@ -35,9 +35,12 @@ import yaml
 import configparser
 import fnmatch
 import time
+import shlex
 from send2trash import send2trash
 
 import collections
+
+from rossum_cli import CliError, Console, fail_missing_file, install_tracebacks, main_guard, print_box, print_error_panel, run_command, run_command_live, write_text
 
 import logging
 logger=None
@@ -222,6 +225,11 @@ TPInterfaces = collections.namedtuple('TPInterfaces',
 def main():
     import argparse
 
+    if len(sys.argv) > 1 and sys.argv[1] in ('doctor', 'timings', 'manifest', 'build'):
+        sys.exit(run_modern_command(sys.argv[1:]))
+    if len(sys.argv) == 1 and is_rossum_build_dir(os.getcwd()):
+        return run_interactive_shell(os.getcwd())
+
     description=("Version {0}\n\nA cmake-like Makefile generator for Fanuc "
         "Robotics (Karel) projects\nthat supports out-of-source "
         "builds.".format(ROSSUM_VERSION))
@@ -240,6 +248,10 @@ def main():
         version='%(prog)s {0}'.format(ROSSUM_VERSION))
     parser.add_argument('-q', '--quiet', action='store_true', dest='quiet',
         help='Be quiet (only warnings and errors will be shown)')
+    parser.add_argument('--no-color', action='store_true', dest='no_color',
+        help='Disable colored output')
+    parser.add_argument('--shell', action='store_true', dest='shell',
+        help='Open the interactive Rossum shell')
     parser.add_argument('--rg64', action='store_true', dest='rg64',
         help='Assume 64-bit Roboguide version.')
     parser.add_argument('-c', '--core', type=str, dest='core_version',
@@ -261,6 +273,12 @@ def main():
         help="Preprocess only; do not translate")
     parser.add_argument('-n', '--no-env', action='store_true', dest='no_env',
         help='Do not search the {0}, even if it is set'.format(ENV_PKG_PATH))
+    parser.add_argument('-nn', '-N', '--ninja', action='store_true', dest='run_ninja',
+        help='Run ninja after generating build.ninja')
+    parser.add_argument('--ninja-target', action='append', default=[], dest='ninja_targets',
+        metavar='TARGET', help='Ninja target to build when --ninja is used; may be repeated')
+    parser.add_argument('--ninja-jobs', type=int, dest='ninja_jobs',
+        metavar='N', help='Number of Ninja jobs when --ninja is used')
     parser.add_argument('-p', '--pkg-dir', action='append', type=str,
         dest='extra_paths', metavar='PATH', default=[],
         help='Additional paths to search for packages (multiple allowed). '
@@ -307,6 +325,8 @@ def main():
     for i in range(1, len(sys.argv)):
         if sys.argv[i].startswith('/D'):
             sys.argv[i] = sys.argv[i].replace('/D', '-D', 1)
+    if '--run-tpp' in sys.argv:
+        sys.exit(run_tpp_from_argv(sys.argv[1:]))
     args = parser.parse_args()
 
     if args.update_manifest_dir:
@@ -316,6 +336,11 @@ def main():
         with open(stamp_path, 'a'):
             os.utime(stamp_path, None)
         sys.exit(0)
+
+    if args.shell:
+      shell_build_dir = os.path.abspath(args.build_dir or os.getcwd())
+      shell_source_dir = os.path.abspath(args.src_dir) if args.src_dir else infer_source_dir(shell_build_dir)
+      return run_interactive_shell(shell_build_dir, source_dir=shell_source_dir, no_color=args.no_color, verbose=args.verbose)
 
 
 
@@ -327,46 +352,91 @@ def main():
 
     # build dir is either CWD or user specified it
     build_dir   = os.path.abspath(args.build_dir or os.getcwd())
+    console = Console(no_color=args.no_color, quiet=args.quiet, verbose=args.verbose)
+
     #clean out files
     # (ref): https://stackoverflow.com/questions/185936/how-to-delete-the-contents-of-a-folder
     if args.rossum_clean:
       # make sure folder has build.ninja file or do not delete
       file_list = os.listdir(build_dir)
       if not any('build.ninja' in s for s in file_list):
-        print('Refuse deletion of folder contents. Folder must have a build.ninja file')
-        sys.exit(1)
+        raise CliError(
+            'Refusing to clean this directory',
+            detail='No build.ninja was found in:\n  {}'.format(build_dir),
+            hints=['Run rossum --clean from a Rossum build directory.'],
+        )
 
+      files_cleaned = 0
+      dirs_cleaned = 0
+      failures = []
       for filename in os.listdir(build_dir):
         file_path = os.path.join(build_dir, filename)
         try:
             if os.path.isfile(file_path) or os.path.islink(file_path):
                 send2trash(file_path)
+                files_cleaned += 1
             elif os.path.isdir(file_path):
                 send2trash(file_path)
+                dirs_cleaned += 1
         except Exception as e:
-            print('Failed to delete %s. Reason: %s' % (file_path, e))
+            failures.append('{}: {}'.format(file_path, e))
       
-      sys.exit(1)
+      if failures:
+        raise CliError(
+            'Clean completed with errors',
+            detail='\n'.join(failures[:20]),
+            hints=['Close programs using files in the build directory, then retry.'],
+        )
+
+      console.success('Cleaned build directory: {}'.format(build_dir))
+      console.table('Removed', ('Type', 'Count'), [
+          ('Files', files_cleaned),
+          ('Folders', dirs_cleaned),
+      ])
+      sys.exit(0)
 
     
     #source directory needs to be specified
     if not args.src_dir:
-      raise RuntimeError("Source directory must be specified.")
+      parser.error("Source directory must be specified.")
     source_dir  = os.path.abspath(args.src_dir)
     extra_paths = [os.path.abspath(p) for p in args.extra_paths]
 
 
     # configure the logger
-    FMT='%(levelname)-8s | %(message)s'
-    logging.basicConfig(format=FMT, level=logging.INFO)
+    log_level = logging.WARNING
+    if args.verbose:
+        log_level = logging.DEBUG
+    if args.quiet:
+        log_level = logging.ERROR
+
+    try:
+        if args.no_color or os.environ.get('NO_COLOR'):
+            raise RuntimeError('plain logging requested')
+        output_encoding = (getattr(sys.stderr, 'encoding', '') or getattr(sys.stdout, 'encoding', '') or '').lower()
+        if 'utf' not in output_encoding:
+            raise RuntimeError('non-utf console')
+        from rich.logging import RichHandler
+        rich_handler = RichHandler(
+            show_time=False,
+            show_path=False,
+            markup=False,
+            rich_tracebacks=True,
+        )
+        logging.basicConfig(
+            level=log_level,
+            format='%(message)s',
+            handlers=[rich_handler],
+        )
+    except Exception:
+        FMT='%(levelname)-8s | %(message)s'
+        logging.basicConfig(format=FMT, level=log_level)
+
     global logger
     logger = logging.getLogger('rossum')
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
+    logger.setLevel(log_level)
 
-    logger.info("This is rossum v{0}".format(ROSSUM_VERSION))
+    logger.debug("This is rossum v{0}".format(ROSSUM_VERSION))
 
 
     # make sure that source dir exists
@@ -587,7 +657,8 @@ def main():
 
     # stop if user wanted a dry-run
     if args.dry_run:
-        logger.info("Requested dry-run, not saving build file")
+        console.success("Dry run completed. No files were written.")
+        print_config_summary(console, args, source_dir, build_dir, robot_ini_loc, build_file_path, build_pkgs)
         sys.exit(0)
 
     ensure_output_dirs(build_pkgs, build_dir)
@@ -662,9 +733,11 @@ def main():
         'hastpp'         : args.hastpp,
         'makeenv'        : make_tpp_env_file,
         'rossum_script'  : os.path.join(template_dir, os.path.basename(__file__)),
+        'rossum_cmd'     : os.path.join(template_dir, 'rossum.cmd'),
         'ninja_build_outputs' : ninja_build_outputs,
         'ninja_main_output'   : ninja_main_output,
         'ninja_all_outputs'   : ninja_all_outputs,
+        'ninja_description'   : ninja_description,
     }
     # write out ninja template
     ninja_fl = open(build_file_path, 'w')
@@ -683,11 +756,933 @@ def main():
     write_manifest(FILE_MANIFEST, man_list, robini_info.ftp)
 
     # done
-    logger.info("Configuration successful, you may now run 'ninja' in the "
-        "build directory.")
+    print_config_summary(console, args, source_dir, build_dir, robot_ini_loc, build_file_path, build_pkgs)
+    if args.run_ninja:
+        return run_ninja_build(
+            console,
+            build_dir,
+            targets=args.ninja_targets,
+            jobs=args.ninja_jobs,
+        )
+    console.success("Configuration complete. Next: run ninja in the build directory.")
 
 
 
+
+
+def run_modern_command(argv):
+    import argparse
+
+    command = argv[0]
+    if command == 'doctor':
+        parser = argparse.ArgumentParser(prog='rossum doctor', description='Check Rossum, FANUC tools, robot.ini, and package paths.')
+        parser.add_argument('src_dir', nargs='?', default=os.getcwd(), metavar='SRC')
+        parser.add_argument('--build-dir', default=os.getcwd(), metavar='PATH')
+        parser.add_argument('-r', '--robot-ini', default=ROBOT_INI_NAME, metavar='INI')
+        parser.add_argument('--no-color', action='store_true')
+        parser.add_argument('-v', '--verbose', action='store_true')
+        args = parser.parse_args(argv[1:])
+        return rossum_doctor(args)
+
+    if command == 'timings':
+        parser = argparse.ArgumentParser(prog='rossum timings', description='Summarize Ninja timing information from .ninja_log.')
+        parser.add_argument('build_dir', nargs='?', default=os.getcwd(), metavar='BUILD')
+        parser.add_argument('--top', type=int, default=12, metavar='N')
+        parser.add_argument('--no-color', action='store_true')
+        args = parser.parse_args(argv[1:])
+        return rossum_timings(args)
+
+    if command == 'manifest':
+        if len(argv) < 2 or argv[1] != 'check':
+            raise CliError(
+                "Unknown manifest command",
+                detail="Expected: rossum manifest check [BUILD]",
+                hints=["Run rossum manifest check from a build directory."],
+            )
+        parser = argparse.ArgumentParser(prog='rossum manifest check', description='Validate .man_log against the build directory.')
+        parser.add_argument('build_dir', nargs='?', default=os.getcwd(), metavar='BUILD')
+        parser.add_argument('--no-color', action='store_true')
+        args = parser.parse_args(argv[2:])
+        return rossum_manifest_check(args)
+
+    if command == 'build':
+        parser = argparse.ArgumentParser(prog='rossum build', description='Run Ninja with clearer Rossum failure reporting.')
+        parser.add_argument('build_dir', nargs='?', default=os.getcwd(), metavar='BUILD')
+        parser.add_argument('targets', nargs='*', metavar='TARGET')
+        parser.add_argument('-j', '--jobs', type=int, metavar='N')
+        parser.add_argument('--dry-run', action='store_true')
+        parser.add_argument('--no-color', action='store_true')
+        parser.add_argument('-v', '--verbose', action='store_true')
+        args = parser.parse_args(argv[1:])
+        return rossum_build(args)
+
+    raise CliError("Unknown Rossum command", detail=command)
+
+
+def rossum_doctor(args):
+    console = Console(no_color=args.no_color, verbose=args.verbose)
+    install_tracebacks(show_locals=args.verbose)
+    src_dir = os.path.abspath(args.src_dir)
+    build_dir = os.path.abspath(args.build_dir)
+    rows = []
+
+    def add(name, ok, detail, warn=False):
+        if ok:
+            status = 'OK'
+        elif warn:
+            status = 'WARN'
+        else:
+            status = 'FAIL'
+        rows.append((name, status, detail))
+
+    add('Python', True, sys.version.split()[0])
+    add('Ninja', bool(shutil.which('ninja')), shutil.which('ninja') or 'not found on PATH')
+    add('ROSSUM_PKG_PATH', ENV_PKG_PATH in os.environ, os.environ.get(ENV_PKG_PATH, 'not set'), warn=True)
+
+    robot_ini = args.robot_ini
+    if not os.path.isabs(robot_ini):
+        cwd_robot = os.path.abspath(robot_ini)
+        src_robot = os.path.join(src_dir, robot_ini)
+        robot_ini = cwd_robot if os.path.exists(cwd_robot) else src_robot
+    add('robot.ini', os.path.exists(robot_ini), robot_ini)
+
+    if os.path.exists(robot_ini):
+        config = configparser.ConfigParser()
+        config.read(robot_ini)
+        has_section = config.has_section('WinOLPC_Util')
+        add('robot.ini section', has_section, 'WinOLPC_Util')
+        if has_section:
+            for key in ('Robot', 'Path', 'Support'):
+                value = config['WinOLPC_Util'].get(key, '')
+                add('robot.ini {}'.format(key), bool(value) and os.path.exists(value), value or 'missing', warn=(key == 'Robot'))
+            ftp = config['WinOLPC_Util'].get('Ftp', os.environ.get(ENV_SERVER_IP, ''))
+            add('Robot IP', bool(ftp), ftp or 'missing')
+
+    search_locs = []
+    search_locs.extend(KTRANS_SEARCH_PATH)
+    search_locs.extend([p for p in os.environ.get('Path', '').split(os.pathsep) if p])
+    for tool in (KTRANS_BIN_NAME, MAKETP_BIN_NAME, TPP_BIN_NAME, KTRANSW_BIN_NAME, XML_BIN_NAME, KCDICT_BIN_NAME):
+        found = first_existing_tool(tool, search_locs)
+        add(tool, bool(found), found or 'not found')
+
+    add('Build directory', os.path.isdir(build_dir), build_dir)
+    add('build.ninja', os.path.exists(os.path.join(build_dir, BUILD_FILE_NAME)), os.path.join(build_dir, BUILD_FILE_NAME), warn=True)
+    add('.man_log', os.path.exists(os.path.join(build_dir, FILE_MANIFEST)), os.path.join(build_dir, FILE_MANIFEST), warn=True)
+
+    console.table('Rossum doctor', ('Check', 'Status', 'Detail'), rows)
+    failed = [row for row in rows if row[1] == 'FAIL']
+    if failed:
+        console.warning('{} check(s) failed.'.format(len(failed)))
+        return 1
+    console.success('All checks passed.')
+    return 0
+
+
+def first_existing_tool(tool, search_locs):
+    for search_loc in search_locs:
+        path = os.path.join(search_loc, tool)
+        if os.path.exists(path):
+            return path
+    return shutil.which(tool)
+
+
+def rossum_timings(args):
+    console = Console(no_color=args.no_color)
+    ninja_log = os.path.join(os.path.abspath(args.build_dir), '.ninja_log')
+    if not os.path.exists(ninja_log):
+        fail_missing_file(ninja_log, 'Ninja log')
+
+    rows = []
+    with open(ninja_log, 'r', encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.rstrip().split('\t')
+            if len(parts) < 4:
+                continue
+            try:
+                start = int(parts[0])
+                end = int(parts[1])
+            except ValueError:
+                continue
+            rows.append((end - start, start, end, parts[3]))
+
+    if not rows:
+        raise CliError('No timing entries found', detail=ninja_log)
+
+    wall = max(row[2] for row in rows) - min(row[1] for row in rows)
+    total = sum(row[0] for row in rows)
+    summary = [
+        ('Edges', len(rows)),
+        ('Wall time', '{} ms'.format(wall)),
+        ('Total tool time', '{} ms'.format(total)),
+        ('Parallel factor', '{:.2f}x'.format(total / wall) if wall else 'n/a'),
+    ]
+    console.table('Ninja timing summary', ('Metric', 'Value'), summary)
+    top = sorted(rows, reverse=True)[:args.top]
+    console.table('Slowest build edges', ('Duration', 'Output'), [
+        ('{} ms'.format(duration), os.path.basename(output)) for duration, _, _, output in top
+    ])
+    return 0
+
+
+def rossum_manifest_check(args):
+    console = Console(no_color=args.no_color)
+    build_dir = os.path.abspath(args.build_dir)
+    manifest_path = os.path.join(build_dir, FILE_MANIFEST)
+    if not os.path.exists(manifest_path):
+        fail_missing_file(manifest_path, 'Manifest')
+
+    with open(manifest_path, 'r', encoding='utf-8', errors='replace') as handle:
+        manifest = yaml.safe_load(handle) or {}
+    if not isinstance(manifest, dict):
+        raise CliError('Manifest format is invalid', detail=manifest_path)
+
+    rows = []
+    missing = []
+    for section, entries in manifest.items():
+        if section == 'ip':
+            continue
+        if not isinstance(entries, dict):
+            rows.append((section, 'FAIL', 'section is not a mapping'))
+            continue
+        section_missing = 0
+        total = 0
+        for parent, children in entries.items():
+            total += 1
+            if not os.path.exists(os.path.join(build_dir, parent)):
+                missing.append('{}: {}'.format(section, parent))
+                section_missing += 1
+            for child in children or []:
+                total += 1
+                if not os.path.exists(os.path.join(build_dir, child)):
+                    missing.append('{} child: {}'.format(section, child))
+                    section_missing += 1
+        rows.append((section, 'OK' if section_missing == 0 else 'FAIL', '{} file(s), {} missing'.format(total, section_missing)))
+
+    console.table('Manifest check', ('Section', 'Status', 'Detail'), rows)
+    if missing:
+        console.panel('Missing files', '\n'.join(missing[:40]), style='red')
+        return 1
+    console.success('Manifest matches files in build directory.')
+    return 0
+
+
+def rossum_build(args):
+    console = Console(no_color=args.no_color, verbose=args.verbose)
+    build_dir = os.path.abspath(args.build_dir)
+    build_file = os.path.join(build_dir, BUILD_FILE_NAME)
+    if not os.path.exists(build_file):
+        fail_missing_file(build_file, 'Ninja build file')
+
+    if args.dry_run:
+        command = ['ninja']
+        if args.jobs:
+            command.extend(['-j', str(args.jobs)])
+        command.extend(args.targets)
+        console.info('Would run in {}: {}'.format(build_dir, ' '.join(command)))
+        return 0
+
+    return run_ninja_build(console, build_dir, targets=args.targets, jobs=args.jobs)
+
+
+def run_ninja_build(console, build_dir, targets=None, jobs=None):
+    command = ['ninja']
+    if jobs:
+        command.extend(['-j', str(jobs)])
+    command.extend(targets or [])
+
+    console.info('Running {}'.format(' '.join(command)))
+    result = run_command_live(command, cwd=build_dir, console=console, label='Building with Ninja')
+    log_dir = os.path.join(build_dir, '.rossum')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    log_path = os.path.join(log_dir, 'ninja-last.log')
+    write_text(log_path, result.output)
+
+    if result.returncode != 0:
+        detail = summarize_ninja_failure(result.output)
+        raise CliError(
+            'Ninja build failed',
+            detail='Return code: {}\nLog: {}\n\n{}'.format(result.returncode, log_path, detail),
+            hints=[
+                'Open the log only if the summary above is not enough.',
+                'Fix the source file shown in the summary, then run rossum -nn again.',
+            ],
+        )
+
+    if result.output.strip():
+        console.panel('Ninja output', result.output[-4000:], style='cyan')
+    console.success('Ninja build completed. Log: {}'.format(log_path))
+    return 0
+
+
+def summarize_ninja_failure(output, source_hint=None):
+    lines = output.splitlines()
+    tpplus_summary = summarize_tpplus_failure(lines, source_hint=source_hint)
+    if tpplus_summary:
+        return tpplus_summary
+
+    interesting = []
+    capture = False
+    for line in lines:
+        if line.startswith('FAILED:') or 'FAILED:' in line:
+            capture = True
+        if capture:
+            interesting.append(line)
+        if capture and len(interesting) >= 20:
+            break
+    return '\n'.join(interesting) if interesting else output[-4000:]
+
+
+def summarize_tpplus_failure(lines, source_hint=None):
+    parse_line = None
+    runtime_line = None
+    runtime_message = None
+    source = source_hint
+    context = []
+
+    source_pattern = re.compile(r'([A-Za-z]:[^\s"]+?\.tpp)|"([^"]+?\.tpp)"')
+    for raw_line in lines:
+        line = clean_report_line(raw_line)
+        if source is None:
+            if line.lower().startswith('source:'):
+                source_value = line.split(':', 1)[1].strip()
+                if source_value:
+                    source = source_value
+            match = source_pattern.search(line)
+            if match:
+                source = match.group(1) or match.group(2)
+        if 'TPPlus::Parser::ParseError' in line or 'Parse error on line' in line:
+            parse_line = line.strip()
+            if parse_line.startswith('Message: '):
+                parse_line = parse_line[len('Message: '):]
+        runtime_match = re.search(r'Runtime error on line\s+([0-9]+)|^Line:\s*([0-9]+)', line)
+        if runtime_match and runtime_line is None:
+            runtime_line = int(runtime_match.group(1) or runtime_match.group(2))
+        message_match = re.search(r'Variable\s+\(([^)]+)\)\s+not defined', line)
+        if message_match and runtime_message is None:
+            runtime_message = 'Variable "{}" is not defined'.format(message_match.group(1))
+        message_match = re.search(r'^Message:\s*(.+)$', line)
+        if message_match and runtime_message is None and 'Variable ' in message_match.group(1):
+            runtime_message = message_match.group(1).strip()
+        if line.startswith('==:') or line.startswith('=>:'):
+            if line not in context:
+                context.append(line)
+
+    if not parse_line:
+        if runtime_line or runtime_message:
+            return summarize_tpplus_runtime_failure(source, runtime_line, runtime_message)
+        return None
+
+    location = ''
+    match = re.search(r'Parse error on line\s+([0-9]+)\s+column\s+([0-9]+)', parse_line)
+    if match:
+        location = 'line {}, column {}'.format(match.group(1), match.group(2))
+
+    rows = ['[bold red]TP+ parser error[/bold red]']
+    if source:
+        rows.append('[cyan]Source:[/cyan] {}'.format(display_path(source)))
+    if location:
+        rows.append('[cyan]Location:[/cyan] {}'.format(location))
+    rows.append('[cyan]Message:[/cyan] {}'.format(parse_line))
+    if source and match:
+        source_detail = source_error_context(source, int(match.group(1)))
+        if source_detail:
+            rows.append('')
+            rows.append(source_detail)
+    if context:
+        rows.append('')
+        rows.append('Parser context:')
+        rows.extend(context[-6:])
+    rows.append('')
+    rows.append('[yellow]Fix:[/yellow] check for a missing end, incomplete block, or unfinished statement near the reported TP+ line.')
+    return '\n'.join(rows)
+
+
+def clean_report_line(line):
+    line = str(line).rstrip()
+    stripped = line.strip()
+    if stripped.startswith('|') and stripped.endswith('|'):
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def summarize_tpplus_runtime_failure(source, line_no=None, message=None):
+    rows = ['[bold red]TP+ runtime error[/bold red]']
+    if source:
+        rows.append('[cyan]Source:[/cyan] {}'.format(display_path(source)))
+    if line_no:
+        rows.append('[cyan]Line:[/cyan] {}'.format(line_no))
+    if message:
+        rows.append('[cyan]Message:[/cyan] {}'.format(message))
+    rows.append('')
+    if source and line_no:
+        source_detail = source_error_context(source, int(line_no), radius=3, include_block_hint=False)
+        if source_detail:
+            rows.append(source_detail)
+            rows.append('')
+    rows.append('[yellow]Fix:[/yellow] correct the value/name used at the reported source line, then rebuild.')
+    return '\n'.join(rows)
+
+
+def source_error_context(source_path, line_no, radius=5, include_block_hint=True):
+    if not os.path.exists(source_path):
+        return None
+
+    try:
+        with open(source_path, 'r', encoding='utf-8', errors='replace') as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    start = max(1, line_no - radius)
+    end = min(len(lines), line_no + radius)
+    out = ['[cyan]Source context:[/cyan]']
+    for idx in range(start, end + 1):
+        marker = '>' if idx == line_no else ' '
+        prefix = '[line]>{:4d}:[/line]'.format(idx) if idx == line_no else ' {:4d}:'.format(idx)
+        out.append('{} {}'.format(prefix, lines[idx - 1].rstrip()))
+
+    block_hint = analyze_tpp_blocks(lines, line_no) if include_block_hint else None
+    if block_hint:
+        out.append('')
+        out.append(block_hint)
+    return '\n'.join(out)
+
+
+def display_path(path):
+    if not path:
+        return path
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.getcwd())
+        if len(rel) < len(path) and not rel.startswith('..\\..'):
+            return rel
+    except ValueError:
+        pass
+    return os.path.basename(path) if len(path) > 90 else path
+
+
+def analyze_tpp_blocks(lines, line_no):
+    openers = ('if', 'for', 'while', 'select', 'case', 'def', 'namespace')
+    stack = []
+
+    for idx, raw_line in enumerate(lines[:line_no], start=1):
+        line = raw_line.strip()
+        if not line or line.startswith('#') or line.startswith('--'):
+            continue
+        line = line.split('#', 1)[0].strip()
+
+        first = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\b', line)
+        if not first:
+            continue
+        keyword = first.group(1).lower()
+
+        if keyword in openers:
+            stack.append((keyword, idx, raw_line.rstrip()))
+        elif keyword == 'end':
+            if stack:
+                stack.pop()
+        elif keyword == 'else':
+            if not stack or stack[-1][0] != 'if':
+                return 'Block hint: line {} has else without a visible matching if.'.format(idx)
+
+    if stack:
+        keyword, idx, text = stack[-1]
+        return 'Block hint: possible missing end for {} opened at line {}:\n  {}'.format(keyword, idx, text)
+    return 'Block hint: no obvious unmatched if/def/namespace before the parser line. Check the last statement before this location.'
+
+
+def run_tpp_from_argv(argv):
+    import argparse
+
+    parser = argparse.ArgumentParser(prog='rossum --run-tpp', add_help=False)
+    parser.add_argument('--run-tpp', action='store_true')
+    parser.add_argument('--tpp-tool')
+    parser.add_argument('--tpp-source')
+    parser.add_argument('--tpp-output')
+    parser.add_argument('--tpp-env')
+    parser.add_argument('--tpp-makeenv')
+    parser.add_argument('--tpp-keepgpp', action='store_true')
+    parser.add_argument('--tpp-rsp')
+
+    pre_args, _ = parser.parse_known_args(argv)
+    rsp_args = []
+    if pre_args.tpp_rsp:
+        rsp_args = read_tpp_response_args(pre_args.tpp_rsp)
+    args, extra = parser.parse_known_args(argv + rsp_args)
+
+    if extra and extra[0] == '--':
+        extra = extra[1:]
+
+    missing = [name for name, value in (
+        ('--tpp-tool', args.tpp_tool),
+        ('--tpp-source', args.tpp_source),
+        ('--tpp-output', args.tpp_output),
+    ) if not value]
+    if missing:
+        print_error_panel('TP+ failed', '\n'.join([
+            'TP+ wrapper configuration is incomplete',
+            '',
+            'Missing: {}'.format(', '.join(missing)),
+            '',
+            'Fix: rerun rossum to regenerate build.ninja.',
+        ]))
+        return 1
+
+    if args.tpp_env and not os.path.exists(args.tpp_env):
+        print_error_panel('TP+ failed', '\n'.join([
+            'TP+ environment file not found',
+            '',
+            'Env: {}'.format(args.tpp_env),
+            'Source: {}'.format(args.tpp_source),
+            '',
+            'Fix: check robot.ini Env= and rerun rossum to regenerate build.ninja.',
+        ]))
+        return 1
+
+    command = [
+        args.tpp_tool,
+        args.tpp_source,
+        '-o',
+        args.tpp_output,
+    ]
+    if args.tpp_env:
+        command.extend(['-e', args.tpp_env])
+    if args.tpp_makeenv:
+        command.extend(['-k', args.tpp_makeenv])
+    if args.tpp_keepgpp:
+        command.append('-p')
+    command.extend(extra)
+
+    result = run_command(command)
+    output_has_error = tpp_output_has_error(result.output)
+    if result.returncode == 0 and not output_has_error:
+        if result.output.strip():
+            print(result.output)
+        return 0
+
+    summary = summarize_ninja_failure(result.output, source_hint=args.tpp_source)
+    print_error_panel('TP+ failed', summary)
+    return result.returncode or 1
+
+
+def read_tpp_response_args(path):
+    if not path:
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            content = handle.read()
+    except OSError as exc:
+        print_error_panel('TP+ failed', '\n'.join([
+            'TP+ response file not found',
+            '',
+            'File: {}'.format(display_path(path)),
+            'Error: {}'.format(exc),
+        ]))
+        sys.exit(1)
+
+    try:
+        return shlex.split(content, posix=True)
+    except ValueError as exc:
+        print_error_panel('TP+ failed', '\n'.join([
+            'TP+ response file is invalid',
+            '',
+            'File: {}'.format(display_path(path)),
+            'Error: {}'.format(exc),
+        ]))
+        sys.exit(1)
+
+
+def tpp_output_has_error(output):
+    lowered = (output or '').lower()
+    return any(token in lowered for token in (
+        'does not exist',
+        'parse error',
+        'tpplus::parser::parseerror',
+        'runtime error',
+        'no such file',
+        'error:',
+    ))
+
+
+def print_config_summary(console, args, source_dir, build_dir, robot_ini_loc, build_file_path, build_pkgs):
+    outputs = 0
+    sections = collections.defaultdict(int)
+    for pkg in build_pkgs:
+        for obj in pkg.objects:
+            count = len(as_list(obj[1]))
+            outputs += count
+            sections[obj[3]] += count
+
+    requested = []
+    if args.buildsource:
+        requested.append('source')
+    if args.build_ls:
+        requested.append('tp')
+    if args.inc_tests:
+        requested.append('tests')
+    if args.build_forms:
+        requested.append('forms')
+    if args.build_interface:
+        requested.append('interfaces')
+    if args.compiletp:
+        requested.append('compile-tp')
+    if args.preserve_build_paths:
+        requested.append('preserve-paths')
+
+    rows = [
+        ('Source', source_dir),
+        ('Build', build_dir),
+        ('Packages', str(len(build_pkgs))),
+        ('Outputs', str(outputs)),
+        ('Mode', ', '.join(requested) if requested else 'configure only'),
+        ('Robot ini', robot_ini_loc),
+        ('Build file', build_file_path),
+        ('Manifest', os.path.join(build_dir, FILE_MANIFEST)),
+    ]
+
+    if sections:
+        rows.append(('Sections', ', '.join(['{}={}'.format(k, v) for k, v in sorted(sections.items())])))
+
+    console.table('Rossum configuration', ('Item', 'Value'), rows)
+
+
+def is_rossum_build_dir(path):
+    return os.path.exists(os.path.join(os.path.abspath(path), BUILD_FILE_NAME))
+
+
+def infer_source_dir(build_dir):
+    build_dir = os.path.abspath(build_dir)
+    parent = os.path.abspath(os.path.join(build_dir, os.pardir))
+    if os.path.exists(os.path.join(parent, ROBOT_INI_NAME)) or os.path.exists(os.path.join(parent, 'package.json')):
+        return parent
+
+    build_file = os.path.join(build_dir, BUILD_FILE_NAME)
+    if os.path.exists(build_file):
+        try:
+            with open(build_file, 'r', encoding='utf-8', errors='replace') as handle:
+                for line in handle:
+                    match = re.match(r'^[A-Za-z0-9_.-]+_dir\s*=\s*(.+)$', line.strip())
+                    if match:
+                        candidate = os.path.abspath(match.group(1).strip())
+                        if os.path.exists(candidate):
+                            return candidate
+        except OSError:
+            pass
+    return parent
+
+
+def run_interactive_shell(build_dir, source_dir=None, no_color=False, verbose=False):
+    console = Console(no_color=no_color, verbose=verbose)
+    build_dir = os.path.abspath(build_dir)
+    source_dir = os.path.abspath(source_dir or infer_source_dir(build_dir))
+    state = {
+        'build_dir': build_dir,
+        'source_dir': source_dir,
+        'last_error': '',
+        'last_result': 'Ready',
+    }
+
+    print_shell_intro(console, state)
+    shell_status(console, state)
+    console.print('')
+    console.print('[dim]Type /help for commands. Type /exit to close Rossum.[/dim]')
+
+    while True:
+        try:
+            if console.rich:
+                raw = console.rich.input('\n[bold cyan]rossum[/bold cyan] [dim]>[/dim] ')
+            else:
+                raw = input('\nrossum> ')
+        except EOFError:
+            console.print('')
+            break
+        except KeyboardInterrupt:
+            console.print('')
+            console.warning('Use /exit to close Rossum.')
+            continue
+
+        raw = raw.strip()
+        if not raw:
+            continue
+        if not raw.startswith('/'):
+            console.warning('Commands start with /. Try /help.')
+            continue
+
+        try:
+            should_exit = handle_shell_command(console, state, raw)
+            if should_exit:
+                break
+        except CliError as exc:
+            console.print_error(exc)
+            state['last_error'] = exc.title
+            state['last_result'] = 'Failed'
+        except Exception as exc:
+            if os.environ.get('ROSSUM_DEBUG'):
+                raise
+            console.print_error(CliError(
+                'Interactive command failed',
+                detail=str(exc),
+                hints=['Run the command again with ROSSUM_DEBUG=1 for a full traceback.'],
+            ))
+            state['last_error'] = str(exc)
+            state['last_result'] = 'Failed'
+
+    console.success('Rossum closed.')
+    return 0
+
+
+def print_shell_intro(console, state):
+    body = '\n'.join([
+        '[bold cyan]ROSSUM[/bold cyan] [dim]v{}[/dim]'.format(ROSSUM_VERSION),
+        '[dim]Interactive robot build console[/dim]',
+    ])
+    console.panel('Welcome', body, style='cyan')
+
+
+def handle_shell_command(console, state, raw):
+    try:
+        parts = shlex.split(raw[1:])
+    except ValueError as exc:
+        raise CliError('Command syntax is invalid', detail=str(exc), hints=['Check quotes and try again.'])
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    args = parts[1:]
+
+    if command in ('exit', 'quit', 'q'):
+        return True
+    if command == 'help':
+        shell_help(console)
+    elif command == 'status':
+        shell_status(console, state)
+    elif command == 'config':
+        shell_config(console, state, args)
+    elif command == 'build':
+        shell_build(console, state, args)
+    elif command == 'send':
+        shell_send(console, state, args)
+    elif command == 'test':
+        shell_test(console, state, args)
+    elif command == 'clean':
+        shell_clean(console, state)
+    elif command == 'check':
+        shell_check(console, state, args)
+    elif command == 'log':
+        shell_log(console, state, args)
+    else:
+        raise CliError('Unknown command', detail='/{0}'.format(command), hints=['Run /help to see available commands.'])
+    return False
+
+
+def shell_help(console):
+    rows = [
+        ('/status', 'Show source, build, robot, mode, and last result'),
+        ('/config [tp|tests|source|all]', 'Generate build.ninja'),
+        ('/build [tp|tests|source|all]', 'Run Ninja, optionally configuring first'),
+        ('/send [--dry|--only tp|--skip data]', 'Send files to robot using kpush'),
+        ('/test [--list|program]', 'Run KUnit tests'),
+        ('/clean', 'Clean the build directory after confirmation'),
+        ('/check [tools|manifest|robot]', 'Run diagnostics'),
+        ('/log [build|send|test]', 'Show recent logs'),
+        ('/exit', 'Close Rossum'),
+    ]
+    console.table('Rossum commands', ('Command', 'Action'), rows)
+
+
+def shell_status(console, state):
+    build_dir = state['build_dir']
+    source_dir = state['source_dir']
+    manifest = read_manifest_if_present(build_dir)
+    mode = detect_shell_mode(manifest)
+    robot_ip = manifest.get('ip', 'not set') if isinstance(manifest, dict) else 'not set'
+    rows = [
+        ('Source', source_dir),
+        ('Build', build_dir),
+        ('Build file', 'yes' if os.path.exists(os.path.join(build_dir, BUILD_FILE_NAME)) else 'missing'),
+        ('Manifest', 'yes' if os.path.exists(os.path.join(build_dir, FILE_MANIFEST)) else 'missing'),
+        ('Mode', mode),
+        ('Robot', robot_ip or 'not set'),
+        ('Last result', state.get('last_result', 'Ready')),
+    ]
+    if state.get('last_error'):
+        rows.append(('Last error', state['last_error']))
+    console.table('Rossum status', ('Item', 'Value'), rows)
+
+
+def shell_config(console, state, args):
+    mode = args[0].lower() if args else detect_shell_mode(read_manifest_if_present(state['build_dir']))
+    if mode == 'unknown':
+        mode = 'tp'
+    command = rossum_config_command(state, mode)
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Configuring {}'.format(mode))
+
+
+def shell_build(console, state, args):
+    if args:
+        shell_config(console, state, args[:1])
+    command = ['ninja']
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Building with Ninja')
+
+
+def shell_send(console, state, args):
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kpush.py')
+    mapped = map_shell_flags(args)
+    command = [sys.executable, script, '--build-dir', state['build_dir']]
+    command.extend(mapped)
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Sending programs to robot')
+
+
+def shell_test(console, state, args):
+    if '--list' in args:
+        tests = shell_test_programs(state['build_dir'])
+        if not tests:
+            console.warning('No KUnit test programs found in .man_log.')
+            return
+        console.table('KUnit tests', ('Program',), [(item,) for item in tests])
+        return
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kunit.py')
+    command = [sys.executable, script, '--build-dir', state['build_dir']]
+    mapped = map_shell_flags(args)
+    value_options = {'--timeout', '--ip', '--manifest'}
+    idx = 0
+    while idx < len(mapped):
+        arg = mapped[idx]
+        if arg in value_options:
+            if idx + 1 >= len(mapped):
+                raise CliError('Missing option value', detail=arg)
+            command.extend([arg, mapped[idx + 1]])
+            idx += 2
+            continue
+        if arg.startswith('-'):
+            command.append(arg)
+        else:
+            command.extend(['--program', arg])
+        idx += 1
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Running KUnit')
+
+
+def shell_clean(console, state):
+    answer = input('Clean build directory? This moves build outputs to trash. [y/N] ').strip().lower()
+    if answer not in ('y', 'yes'):
+        console.info('Clean cancelled.')
+        return
+    command = [sys.executable, os.path.abspath(__file__), '--clean']
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Cleaning build directory')
+
+
+def shell_check(console, state, args):
+    target = args[0].lower() if args else 'tools'
+    if target == 'manifest':
+        command = [sys.executable, os.path.abspath(__file__), 'manifest', 'check', state['build_dir']]
+    elif target in ('tools', 'robot'):
+        command = [
+            sys.executable,
+            os.path.abspath(__file__),
+            'doctor',
+            state['source_dir'],
+            '--build-dir',
+            state['build_dir'],
+        ]
+    else:
+        raise CliError('Unknown check target', detail=target, hints=['Use /check tools, /check robot, or /check manifest.'])
+    run_shell_process(console, state, command, cwd=state['build_dir'], label='Checking {}'.format(target))
+
+
+def shell_log(console, state, args):
+    target = args[0].lower() if args else 'build'
+    build_dir = state['build_dir']
+    candidates = {
+        'build': [os.path.join(build_dir, '.rossum', 'ninja-last.log'), os.path.join(build_dir, '.ninja_log')],
+        'send': [os.path.join(build_dir, 'ftp.log')],
+        'test': [os.path.join(build_dir, 'kunit.log')],
+    }
+    if target not in candidates:
+        raise CliError('Unknown log target', detail=target, hints=['Use /log build, /log send, or /log test.'])
+    for path in candidates[target]:
+        if os.path.exists(path):
+            console.panel('{} log'.format(target.title()), tail_text(path, 80), style='cyan')
+            return
+    raise CliError('Log not found', detail=', '.join(candidates[target]))
+
+
+def run_shell_process(console, state, command, cwd, label):
+    result = run_command_live(command, cwd=cwd, console=console, label=label)
+    if result.returncode != 0:
+        detail = summarize_ninja_failure(result.output) if command and command[0] == 'ninja' else result.output[-4000:]
+        state['last_error'] = detail
+        state['last_result'] = 'Failed'
+        raise CliError(label + ' failed', detail=detail, exit_code=result.returncode)
+    state['last_error'] = ''
+    state['last_result'] = label + ' completed'
+    console.success(label + ' completed.')
+
+
+def rossum_config_command(state, mode):
+    flags_by_mode = {
+        'tp': ['-l'],
+        'tests': ['-t'],
+        'test': ['-t'],
+        'source': ['-s'],
+        'all': ['-s', '-l', '-t', '-i', '-f'],
+    }
+    if mode not in flags_by_mode:
+        raise CliError('Unknown config mode', detail=mode, hints=['Use tp, tests, source, or all.'])
+    return [sys.executable, os.path.abspath(__file__), state['source_dir'], state['build_dir']] + flags_by_mode[mode]
+
+
+def map_shell_flags(args):
+    mapped = []
+    for arg in args:
+        mapped.append('--dry-run' if arg == '--dry' else arg)
+    return mapped
+
+
+def read_manifest_if_present(build_dir):
+    manifest_path = os.path.join(build_dir, FILE_MANIFEST)
+    if not os.path.exists(manifest_path):
+        return {}
+    try:
+        with open(manifest_path, 'r', encoding='utf-8', errors='replace') as handle:
+            data = yaml.safe_load(handle) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def detect_shell_mode(manifest):
+    if not isinstance(manifest, dict) or not manifest:
+        return 'unknown'
+    sections = {key for key, value in manifest.items() if key != 'ip' and value}
+    if any(section.startswith('test') for section in sections):
+        return 'tests'
+    if 'tp' in sections:
+        return 'tp'
+    if 'src' in sections or 'karel' in sections:
+        return 'source'
+    if len(sections) > 1:
+        return 'all'
+    return 'unknown'
+
+
+def shell_test_programs(build_dir):
+    manifest = read_manifest_if_present(build_dir)
+    tests = manifest.get('test')
+    if not isinstance(tests, dict):
+        return []
+    return [os.path.splitext(name)[0] for name in tests.keys()]
+
+
+def tail_text(path, max_lines):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        raise CliError('Could not read log', detail='{}: {}'.format(path, exc))
+    return ''.join(lines[-max_lines:]) or '(empty log)'
 
 
 def find_files_recur(top_dir, pattern):
@@ -771,6 +1766,13 @@ def find_pkgs(dirs, args):
                     tests=[],
                     macros=[])
             pkgs.append(pkg)
+        except InvalidManifestException as e:
+            mfest_loc = os.path.join(os.path.split(
+                os.path.dirname(manifest_file_path))[1], os.path.basename(manifest_file_path))
+            if str(e) == "Not a rossum pkg":
+                logger.debug("Ignoring non-Rossum manifest {0}: {1}.".format(mfest_loc, e))
+            else:
+                logger.warning("Error parsing manifest {0}: {1}.".format(mfest_loc, e))
         except Exception as e:
             mfest_loc = os.path.join(os.path.split(
                 os.path.dirname(manifest_file_path))[1], os.path.basename(manifest_file_path))
@@ -1286,6 +2288,27 @@ def ninja_all_outputs(pkgs):
     return ' '.join(outputs)
 
 
+def ninja_description(src, pkg_name, compiletp):
+    lower = src.lower()
+    if lower.endswith('.tpp'):
+        action = 'TP+ -> TP' if compiletp else 'TP+ -> LS'
+    elif lower.endswith('.kl'):
+        action = 'KAREL -> PC'
+    elif lower.endswith('.ls'):
+        action = 'LS -> TP' if compiletp else 'LS copy'
+    elif lower.endswith(('.yml', '.yaml', '.json')):
+        action = 'DATA -> XML'
+    elif lower.endswith('.xml'):
+        action = 'XML copy'
+    elif lower.endswith('.csv'):
+        action = 'CSV copy'
+    elif lower.endswith(('.utx', '.ftx')):
+        action = 'FORM -> TX'
+    else:
+        action = 'BUILD'
+    return '{} | {} :: {}'.format(action, pkg_name.replace(' ', '_'), src)
+
+
 def manifest_objects(pkgs):
     objects = []
     for pkg in pkgs:
@@ -1539,13 +2562,12 @@ def find_robotini(source_dir, args):
     # check that it actually exists
     logger.debug("Checking: {}".format(robot_ini_loc))
     if not os.path.exists(robot_ini_loc):
-        logger.warning("No {} in CWD, and no alternative provided, trying "
-            "source space".format(ROBOT_INI_NAME))
+        logger.debug("No {} in CWD, trying source space".format(ROBOT_INI_NAME))
 
         robot_ini_loc = os.path.join(source_dir, ROBOT_INI_NAME)
         logger.debug("Checking: {}".format(robot_ini_loc))
         if os.path.exists(robot_ini_loc):
-            logger.info("Found {} in source space".format(ROBOT_INI_NAME))
+            logger.debug("Found {} in source space".format(ROBOT_INI_NAME))
         else:
             logger.warning("File does not exist: {}".format(robot_ini_loc))
             logger.fatal("Cannot find a {}, aborting".format(ROBOT_INI_NAME))
@@ -1558,8 +2580,8 @@ def find_robotini(source_dir, args):
         with open(robot_ini_loc, 'r') as f:
             robot_ini_txt = f.read()
             if ('Path' in robot_ini_txt) or ('Support' in robot_ini_txt):
-                logger.warning("Found {} contains potentially conflicting ktrans "
-                    "settings!".format(ROBOT_INI_NAME))
+                logger.debug("Found {} contains potentially conflicting ktrans "
+                    "settings.".format(ROBOT_INI_NAME))
     
     return robot_ini_loc
 
@@ -1918,4 +2940,4 @@ def graph_tests():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main_guard(main, tool_name='rossum'))

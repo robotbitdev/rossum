@@ -103,30 +103,38 @@ rule maketp_ls
 #
 # Run ls files through
 rule tpp_tp
-  command = "@(tools['tpp']['path'])" $
-               $in $
-               -o $main_out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
-               @[if makeenv]@ -k "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
-               @[if keepgpp]@ -p @[end if]@ $
-               $lib_includes $
+  command = cmd /d /c call "@(rossum_cmd)" --run-tpp --tpp-rsp "$main_out.rsp" $
                && "@(tools['tpp']['compile'])" $main_out /config "@(ws.robot_ini.path)" $
                && del $main_out
+  rspfile = $main_out.rsp
+  rspfile_content = --tpp-tool "@(tools['tpp']['path'])" $
+               --tpp-source "$in" $
+               --tpp-output "$main_out" $
+               @[if len(ws.robot_ini.env) > 0]@ --tpp-env "@(ws.robot_ini.env)" @[end if]@ $
+               @[if makeenv]@ --tpp-makeenv "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
+               @[if keepgpp]@ --tpp-keepgpp @[end if]@ $
+               -- $
+               $lib_includes
 @[else]@
 # .tpp -> .ls
 #
 # Run ls files through
 rule tpp_ls
-  command = "@(tools['tpp']['path'])" $
-               $in $
-               -o $main_out @[if len(ws.robot_ini.env) > 0]@ -e "@(ws.robot_ini.env)"@[end if]@  $
-               @[if makeenv]@ -k "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
-               @[if keepgpp]@ -p @[end if]@ $
-               $lib_includes $
+  command = cmd /d /c call "@(rossum_cmd)" --run-tpp --tpp-rsp "$main_out.rsp"
+  rspfile = $main_out.rsp
+  rspfile_content = --tpp-tool "@(tools['tpp']['path'])" $
+               --tpp-source "$in" $
+               --tpp-output "$main_out" $
+               @[if len(ws.robot_ini.env) > 0]@ --tpp-env "@(ws.robot_ini.env)" @[end if]@ $
+               @[if makeenv]@ --tpp-makeenv "@(makeenv['name']), @(makeenv['clear']), @(makeenv['config'])" @[end if]@ $
+               @[if keepgpp]@ --tpp-keepgpp @[end if]@ $
+               -- $
+               $lib_includes
 @[end if]@
 @[end if]@
 
 rule manifest_update
-  command = python "@(rossum_script)" --update-manifest "$build_dir"
+  command = cmd /d /c call "@(rossum_cmd)" --update-manifest "$build_dir"
   restat = 1
 
 
@@ -201,7 +209,7 @@ $@(pkg.manifest.name.replace(" ", "_"))_dir\@(src)
   macros = $@(pkg.manifest.name.replace(" ", "_"))_macros
   lib_includes = $@(pkg.manifest.name.replace(" ", "_"))_include_flags
   main_out = @(ninja_main_output(main_out))
-  description = @(pkg.manifest.name.replace(" ", "_")) :: @(src)
+  description = @(ninja_description(src, pkg.manifest.name, compiletp))
 
 @[end for]@
 

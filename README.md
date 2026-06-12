@@ -3,6 +3,9 @@
 This is `rossum`, a CMake-like build file generator for Fanuc Robotics (Karel)
 projects.
 
+See [MODERN_CLI.md](MODERN_CLI.md) for the simple workflow and troubleshooting
+reference.
+
 
 ## Overview
 
