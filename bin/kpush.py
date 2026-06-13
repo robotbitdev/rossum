@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -311,13 +312,14 @@ def render_ftp_script(ip, plan, *, delete_only):
 def add_delete_put_block(lines, label, files, delete_only):
     add_delete_block(lines, label, files)
     if files and not delete_only:
-        lines.append("mput " + " ".join(quote_ftp(fl) for fl in files))
+        for filename in files:
+            lines.append("put " + quote_ftp(filename))
 
 
 def add_delete_block(lines, label, files):
     files = list(files)
-    if files:
-        lines.append("mdel " + " ".join(quote_ftp(fl) for fl in files))
+    for filename in files:
+        lines.append("delete " + quote_ftp(filename))
 
 
 def quote_ftp(filename):
@@ -332,11 +334,49 @@ def run_ftp(ftp_file, ftp_log, build_dir, timeout):
 
 def find_ftp_errors(output):
     lines = []
+    active_command = None
+    active_files = []
+    active_index = 0
+
     for line in output.splitlines():
+        parsed = parse_ftp_command(line)
+        if parsed:
+            active_command, active_files = parsed
+            active_index = 0
+
         lowered = line.lower()
         if any(pattern in lowered for pattern in FTP_ERROR_PATTERNS):
-            lines.append(line)
+            filename = active_file(active_files, active_index)
+            if filename:
+                lines.append("{}: {} ({})".format(filename, line, active_command))
+                if active_index < len(active_files) - 1:
+                    active_index += 1
+            elif active_command:
+                lines.append("{}: {}".format(active_command, line))
+            else:
+                lines.append(line)
     return lines
+
+
+def parse_ftp_command(line):
+    match = re.match(r'^ftp>\s*(put|mput|delete|mdel)\s+(.+)$', line.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    command = match.group(1).lower()
+    files = re.findall(r'"([^"]+)"', match.group(2))
+    if not files:
+        files = [part for part in match.group(2).split() if part]
+    return command, files
+
+
+def active_file(files, index):
+    if not files:
+        return None
+    if index < 0:
+        index = 0
+    if index >= len(files):
+        index = len(files) - 1
+    return files[index]
 
 
 if __name__ == "__main__":
